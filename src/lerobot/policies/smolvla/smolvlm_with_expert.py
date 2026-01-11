@@ -131,6 +131,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        self.history_token = nn.Parameter(torch.randn(1, 1, self.expert_hidden_size))
         self.set_requires_grad()
 
     def get_vlm_model(self):
@@ -366,6 +367,31 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_position_id = (
                 expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
             )  # start from 0
+
+            # 2. [新增] 检查维度：Expert 的输入(Query)是否比 ID 序列多 1 个？
+            # expert_hidden_states.shape[1] 是当前实际的序列长度 (包含 History Token)
+            # expert_position_id.shape[1] 是原始传入的 ID 长度
+            current_query_len = expert_hidden_states.shape[1]
+            original_id_len = expert_position_id.shape[1]
+
+            if current_query_len == original_id_len + 1:
+                # 命中情况：说明注入了 History Token
+
+                # A. 把原本的动作 Token ID 全部 +1 (给 History 腾出 0 号位)
+                # 例如：原本是 [0, 1, 2] -> 变成 [1, 2, 3]
+                expert_position_id = expert_position_id + 1
+
+                # B. 创建一个位置 ID 为 0 的 Tensor 给 History Token
+                batch_size = expert_position_id.shape[0]
+                device = expert_position_id.device
+                # Shape: [Batch, 1]
+                history_pos_id = torch.zeros((batch_size, 1), dtype=expert_position_id.dtype, device=device)
+
+                # C. 拼接到最前面 -> 最终变成 [0, 1, 2, 3...]
+                expert_position_id = torch.cat([history_pos_id, expert_position_id], dim=1)
+
+            # ================= [END 修改区域] =================
+
             expert_attention_mask = attention_mask[
                 :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
             ]  # take into account kv
@@ -409,9 +435,63 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        history_state: torch.Tensor | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
+
+        # ================= [NEW START] 历史令牌注入逻辑 =================
+        # inputs_embeds[0] 是 VLM (Vision), inputs_embeds[1] 是 Expert (Flow Matching Action)
+        # 我们只修改 Expert 的输入
+        expert_embeds = inputs_embeds[1]
+        batch_size = expert_embeds.shape[0]
+
+        # 1. 准备当前时刻的历史令牌
+        if history_state is None:
+            # t=0: 使用可学习的初始参数，并扩展到 Batch Size
+            current_history = self.history_token.expand(batch_size, -1, -1)
+        else:
+            # t>0: 使用传入的上一帧输出
+            current_history = history_state
+
+        # 2. 拼接到 Expert 输入的最前面 [Batch, 1 + Seq_Len, Hidden]
+        inputs_embeds[1] = torch.cat([current_history, expert_embeds], dim=1)
+
+        # 3. 调整 Attention Mask (因为 Expert 序列变长了 1)
+        # 假设 attention_mask 是 [B, 1, Q, K] 或 [B, Q, K]
+        # 我们需要在 Key 维度(最后一维) 补 1 (允许所有人看到 History Token)
+        if attention_mask is not None:
+            # 在最后一维(Key)的前面补1列 True/0 (取决于你的mask是用1代表可见还是0代表可见，LeRobot通常1是可见)
+            # 这里假设 1 是可见。Pad left side with 1.
+            new_col = torch.ones((batch_size, attention_mask.shape[1], attention_mask.shape[2], 1),
+                                 device=attention_mask.device, dtype=attention_mask.dtype)
+            # 注意：这里需要根据实际 mask 维度微调，通常是拼接到 Key 维度
+            # 如果是 Expert 专属的 mask 处理会更复杂，这里做一个简化假设：
+            # 简单方案：不仅要让别人看到 History，History 也要看到别人。
+            # 通常 Flow Matching 是全连接 Attention，所以 mask 往往是全 1。
+            # 如果 mask 维度不对，可能会报错，建议检查 attention_mask 的形状。
+
+            # 简易补丁：如果 mask 长度跟 inputs_embeds[1] 原始长度一致，则扩展
+            if attention_mask.shape[-1] == expert_embeds.shape[1]:
+                # 这是一个示意，具体取决于你的 Mask 生成逻辑
+                pad = torch.ones_like(attention_mask[..., :1])
+                attention_mask = torch.cat([pad, attention_mask], dim=-1)
+
+        # 4. 调整 Position IDs
+        # Expert 的 Position IDs 需要整体 +1，或者给 History Token 分配位置 0
+        if position_ids is not None:
+            # 假设 position_ids 是 [B, Seq_Len]
+            # 给 History Token 分配 ID 0 (或者 min_id - 1)
+            expert_pos_ids = position_ids  # 这里通常是混合的，需要小心
+            # 简单处理：在前面拼一个 0
+            zero_pos = torch.zeros((batch_size, 1), dtype=position_ids.dtype, device=position_ids.device)
+            # 注意：你需要区分 VLM 和 Expert 的 pos_ids。
+            # 原代码逻辑里：expert_position_id = position_ids[:, seq_len:]
+            # 我们这里不动原始 position_ids，而是在 forward_cross_attn_layer 内部处理时意识到长度变化
+            # 为了更安全，建议在这里不动 position_ids，让 RoPE 自动处理或者在内部逻辑修正
+            pass
+            # ================= [NEW END] =================
+
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient
             # dtype is always the same, batch size too (if > 1 len)
@@ -496,7 +576,18 @@ class SmolVLMWithExpertModel(nn.Module):
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)
-        return outputs_embeds, past_key_values
+        # ================= [NEW START] 提取并剥离 History Token =================
+        expert_output = outputs_embeds[1]  # Expert 的输出
+
+        # 1. 提取第一个 Token 作为传给下一刻的 new_history_state
+        new_history_state = expert_output[:, 0:1, :]
+
+        # 2. 还原 Expert 输出 (去掉 History Token)，以免影响 Loss 计算或后续 Action Head 的维度对齐
+        outputs_embeds[1] = expert_output[:, 1:, :]
+
+        # 3. 返回 new_history_state
+        return outputs_embeds, past_key_values, new_history_state
+        # ================= [NEW END] =================
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

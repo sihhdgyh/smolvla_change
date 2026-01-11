@@ -244,6 +244,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        # [NEW] 在最外层定义记忆变量
+        self.current_history_state = None
         self.reset()
 
     def reset(self):
@@ -251,6 +253,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self.current_history_state = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -288,9 +291,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+        actions, new_history = self.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise,
+            history_state=self.current_history_state,  # 传入 Policy 类里存的记忆
+            **kwargs
         )
+        # 3. 将新产生的记忆存回 Policy 类，供下一拍使用
+        self.current_history_state = new_history.detach()
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -377,7 +385,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses, _ = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
+            history_state=None
+        )
         loss_dict["losses_after_forward"] = losses.clone()
 
         if actions_is_pad is not None:
@@ -732,7 +743,7 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, history_state=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -752,22 +763,39 @@ class VLAFlowMatching(nn.Module):
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        # --- 核心修改：适配 Attention Mask ---
+        # 如果你底层强行加了 history_state (1个 token)
+        # 那么掩码也需要增加一列和一行
+
+        # 1. 构造 history 的 mask (假设 history 永远有效且需要被看到)
+        bsize = pad_masks.shape[0]
+        history_mask = torch.ones((bsize, 1), device=pad_masks.device, dtype=pad_masks.dtype)
+
+        # 2. 将 history mask 拼接到最前面
+        full_pad_masks = torch.cat([history_mask, pad_masks], dim=1)  # 长度变为 160
+        full_att_masks = torch.cat([history_mask, att_masks], dim=1)  # 长度变为 160
+
+        # 3. 使用增加后的 mask 生成 2D 矩阵
+        att_2d_masks = make_att_2d_masks(full_pad_masks, full_att_masks)
+
+        # 4. 同样，position_ids 也要基于 160 的长度
+        position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+
+        (_, suffix_out), _, new_history = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            history_state=history_state,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        return losses,new_history
 
     def sample_actions(
         self,
@@ -777,6 +805,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        history_state=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -815,6 +844,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    history_state=history_state, # [NEW] 传给 denoise_step
                 )
 
             if self._rtc_enabled():
@@ -838,7 +868,7 @@ class VLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
-        return x_t
+        return x_t,self.latest_history
 
     def denoise_step(
         self,
@@ -846,29 +876,48 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        history_state=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        # 如果你拼了 1 个 history token，suffix_len 实际上在底层变成了 suffix_len + 1
 
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        # 构造 history 的局部 mask
+        bsize = prefix_pad_masks.shape[0]
+        history_mask = torch.ones((bsize, 1), device=x_t.device, dtype=torch.bool)
+
+        # 扩展当前的 suffix mask
+        extended_suffix_masks = torch.cat([history_mask, suffix_pad_masks], dim=1)
+        extended_suffix_att = torch.cat([history_mask, suffix_att_masks], dim=1)
+
+        # 重新生成 2D 掩码
+        suffix_att_2d_masks = make_att_2d_masks(extended_suffix_masks, extended_suffix_att)
+
+        # 这里的 prefix_pad_2d_masks 也需要多加一列给 history
+        prefix_len = prefix_pad_masks.shape[1]
+        new_suffix_len = suffix_len + 1
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(bsize, new_suffix_len, prefix_len)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
+        # position_ids 同样补位
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(extended_suffix_masks, dim=1) - 1
+
+        outputs_embeds, _, new_history = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            history_state=history_state,  # [NEW] 真正用在这里了
         )
+
+        # 将本次产生的 history 存入类成员变量，方便上一层提取
+        self.latest_history = new_history
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
