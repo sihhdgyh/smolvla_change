@@ -29,6 +29,8 @@ from gymnasium import spaces
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
+from src.lerobot.envs.enrich_text import get_enriched_text
+
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
     """Normalize camera_name into a non-empty list of strings."""
@@ -300,6 +302,18 @@ class LiberoEnv(gym.Env):
         # Increasing this value can improve determinism and reproducibility across resets.
         for _ in range(self.num_steps_wait):
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+
+        # 2. 获取当前帧图片（用于 VLM 输入）
+        # 根据源码，格式化后的 pixels 包含 "image"
+        formatted_obs = self._format_raw_obs(raw_obs)
+        current_img = formatted_obs["pixels"]["image"]  # 这是 [H, W, 3] 的 numpy 数组
+
+        # 3. 调用你的 VLM 函数进行丰富化
+        # 注意：确保 get_enriched_text 函数在外部已定义，或作为类方法
+        print(f"正在丰富化原始指令: {self.task_description}")
+        enriched_text = get_enriched_text(current_img, self.task_description)
+        self.enriched_task_description = enriched_text
+        print(f"丰富后指令: {self.enriched_task_description}")
 
         if self.control_mode == "absolute":
             for robot in self._env.robots:
