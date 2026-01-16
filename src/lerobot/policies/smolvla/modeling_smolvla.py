@@ -549,6 +549,7 @@ class VLAFlowMatching(nn.Module):
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_history=self.config.train_history,
             load_vlm_weights=self.config.load_vlm_weights,
             attention_mode=self.config.attention_mode,
             num_expert_layers=self.config.num_expert_layers,
@@ -606,7 +607,7 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None, history_state: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -684,6 +685,26 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
+
+        # === [NEW] 4. 处理 History Token ===
+        # 将其作为 Prefix 的最后一个 Token 注入，用于聚合所有信息
+        if history_state is None:
+            # 第一帧使用 learned parameter
+            history_emb = self.vlm_with_expert.initial_history_token.expand(bsize, -1, -1)
+        else:
+            # 后续帧使用上一帧 VLM 侧输出的 hidden state (已经过 adapter)
+            history_emb = history_state
+
+        embs.append(history_emb)
+        hist_len = history_emb.shape[1]
+        history_mask = torch.ones(bsize, hist_len, dtype=torch.bool, device=device)
+        pad_masks.append(history_mask)
+
+        # History Token 应该能看到前面所有信息，且能被 Expert 看到，所以设为 0
+        att_masks += [0] * hist_len
+
+        # === 拼接与 Padding ===
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -756,30 +777,15 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state,history_state=history_state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        # --- 核心修改：适配 Attention Mask ---
-        # 如果你底层强行加了 history_state (1个 token)
-        # 那么掩码也需要增加一列和一行
-
-        # 1. 构造 history 的 mask (假设 history 永远有效且需要被看到)
-        bsize = pad_masks.shape[0]
-        history_mask = torch.ones((bsize, 1), device=pad_masks.device, dtype=pad_masks.dtype)
-
-        # 2. 将 history mask 拼接到最前面
-        full_pad_masks = torch.cat([history_mask, pad_masks], dim=1)  # 长度变为 160
-        full_att_masks = torch.cat([history_mask, att_masks], dim=1)  # 长度变为 160
-
-        # 3. 使用增加后的 mask 生成 2D 矩阵
-        att_2d_masks = make_att_2d_masks(full_pad_masks, full_att_masks)
-
-        # 4. 同样，position_ids 也要基于 160 的长度
-        position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         (_, suffix_out), _, new_history = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
@@ -788,7 +794,6 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
-            history_state=history_state,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -817,7 +822,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state,history_state=history_state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -830,6 +835,9 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        # [新增] 保存这一帧生成的 history，以便函数最后返回
+        self.latest_history = _history_tmp
+
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -844,7 +852,6 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
-                    history_state=history_state, # [NEW] 传给 denoise_step
                 )
 
             if self._rtc_enabled():
@@ -871,55 +878,36 @@ class VLAFlowMatching(nn.Module):
         return x_t,self.latest_history
 
     def denoise_step(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-        history_state=None,
+            self,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
-        # 如果你拼了 1 个 history token，suffix_len 实际上在底层变成了 suffix_len + 1
-
-        # 构造 history 的局部 mask
-        bsize = prefix_pad_masks.shape[0]
-        history_mask = torch.ones((bsize, 1), device=x_t.device, dtype=torch.bool)
-
-        # 扩展当前的 suffix mask
-        extended_suffix_masks = torch.cat([history_mask, suffix_pad_masks], dim=1)
-        extended_suffix_att = torch.cat([history_mask, suffix_att_masks], dim=1)
-
-        # 重新生成 2D 掩码
-        suffix_att_2d_masks = make_att_2d_masks(extended_suffix_masks, extended_suffix_att)
-
-        # 这里的 prefix_pad_2d_masks 也需要多加一列给 history
+        batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
-        new_suffix_len = suffix_len + 1
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(bsize, new_suffix_len, prefix_len)
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        # position_ids 同样补位
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(extended_suffix_masks, dim=1) - 1
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _, new_history = self.vlm_with_expert.forward(
+        outputs_embeds, _ ,_history_tmp= self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
-            history_state=history_state,  # [NEW] 真正用在这里了
         )
-
-        # 将本次产生的 history 存入类成员变量，方便上一层提取
-        self.latest_history = new_history
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         return v_t

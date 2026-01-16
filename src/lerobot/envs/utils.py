@@ -146,7 +146,20 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
 
 def add_envs_task(env: gym.vector.VectorEnv, observation: dict[str, Any]) -> dict[str, Any]:
     """Adds task feature to the observation dict with respect to the first environment attribute."""
-    if hasattr(env.envs[0], "task_description"):
+    if hasattr(env.envs[0], "enriched_task_description"):
+        task_result = env.call("enriched_task_description")
+
+        if isinstance(task_result, tuple):
+            task_result = list(task_result)
+
+        if not isinstance(task_result, list):
+            raise TypeError(f"Expected task_description to return a list, got {type(task_result)}")
+        if not all(isinstance(item, str) for item in task_result):
+            raise TypeError("All items in task_description result must be strings")
+
+        observation["task"] = task_result
+
+    elif hasattr(env.envs[0], "task_description"):
         task_result = env.call("task_description")
 
         if isinstance(task_result, tuple):

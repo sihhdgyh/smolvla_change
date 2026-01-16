@@ -64,6 +64,7 @@ class SmolVLMWithExpertModel(nn.Module):
         model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
+        train_history: bool = True,
         freeze_vision_encoder: bool = False,
         attention_mode: str = "self_attn",
         num_expert_layers: int = -1,
@@ -129,9 +130,22 @@ class SmolVLMWithExpertModel(nn.Module):
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_history = train_history
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
-        self.history_token = nn.Parameter(torch.randn(1, 1, self.expert_hidden_size))
+
+        # === [新增] History Token 模块初始化 ===
+        self.vlm_hidden_size = config.text_config.hidden_size
+        target_dtype = torch.bfloat16  # 适配 SmolVLM 默认精度
+
+        # 1. 初始记忆 Token (Parameter)
+        self.initial_history_token = nn.Parameter(
+            torch.randn(1, 1, self.vlm_hidden_size, dtype=target_dtype)
+        )
+
+        # 2. 记忆转换层 (Linear)
+        self.history_adapter = nn.Linear(self.vlm_hidden_size, self.vlm_hidden_size, dtype=target_dtype)
+
         self.set_requires_grad()
 
     def get_vlm_model(self):
@@ -142,10 +156,21 @@ class SmolVLMWithExpertModel(nn.Module):
             self.get_vlm_model().vision_model.eval()
             for params in self.get_vlm_model().vision_model.parameters():
                 params.requires_grad = False
+
         if self.train_expert_only:
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
+            # --- [新增] 如果开启 train_history，解冻 VLM 最后 2 层 ---
+            if self.train_history:
+                # 定义解冻的关键词 (SmolVLM 结构通常为 text_model.model.layers.N)
+                unfreeze_layers = [self.num_vlm_layers - 1, self.num_vlm_layers - 2]
+                unfreeze_keywords = [f"layers.{i}." for i in unfreeze_layers]
+
+                for name, params in self.vlm.named_parameters():
+                    if any(k in name for k in unfreeze_keywords):
+                        params.requires_grad = True
+                print(f"train_history is True: Unfroze VLM layers {unfreeze_layers}")
         else:
             # To avoid unused params issue with distributed training
             last_layers = [self.num_vlm_layers - 1]
@@ -168,6 +193,11 @@ class SmolVLMWithExpertModel(nn.Module):
         for name, params in self.lm_expert.named_parameters():
             if "lm_head" in name:
                 params.requires_grad = False
+
+        # 4. 必须解冻：新增的 History 相关参数 (独立于 train_history 之外，它们总是被训练)
+        self.initial_history_token.requires_grad = True
+        for params in self.history_adapter.parameters():
+            params.requires_grad = True
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -435,7 +465,6 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
-        history_state: torch.Tensor | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -447,32 +476,6 @@ class SmolVLMWithExpertModel(nn.Module):
             if hidden_states is None:
                 continue
             batch_size = hidden_states.shape[0]
-        expert_embeds = inputs_embeds[1]
-
-        if expert_embeds is not None:
-            # 1. 准备当前时刻的历史令牌
-            if history_state is None:
-                # t=0: 使用可学习的初始参数，并扩展到 Batch Size
-                current_history = self.history_token.expand(batch_size, -1, -1)
-            else:
-                # t>0: 使用传入的上一帧输出
-                current_history = history_state
-
-            # 2. 拼接到 Expert 输入的最前面 [Batch, 1 + Seq_Len, Hidden]
-            inputs_embeds[1] = torch.cat([current_history, expert_embeds], dim=1)
-
-            # 3. 调整 Attention Mask (因为 Expert 序列变长了 1)
-            # 假设 attention_mask 是 [B, 1, Q, K] 或 [B, Q, K]
-            # 我们需要在 Key 维度(最后一维) 补 1 (允许所有人看到 History Token)
-            if attention_mask is not None:
-
-                # 简易补丁：如果 mask 长度跟 inputs_embeds[1] 原始长度一致，则扩展
-                if attention_mask.shape[-1] == expert_embeds.shape[1]:
-                    # 这是一个示意，具体取决于你的 Mask 生成逻辑
-                    pad = torch.ones_like(attention_mask[..., :1])
-                    attention_mask = torch.cat([pad, attention_mask], dim=-1)
-
-
 
         # RMSNorm
         num_layers = self.num_vlm_layers
@@ -550,18 +553,23 @@ class SmolVLMWithExpertModel(nn.Module):
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)
-        # ================= [NEW START] 提取并剥离 History Token =================
-        expert_output = outputs_embeds[1]  # Expert 的输出
 
-        if expert_output is not None:
-            new_history_state=expert_output[:,0:1,:]
-            outputs_embeds[1] = expert_output[:,1:,:]
-        else:
-            new_history_state = history_state
+        # === [NEW] 提取并生成下一帧的 History State ===
+        # 假设 inputs_embeds[0] 是 VLM Prefix: [Vision, Text, Proprio, HISTORY]
+        # 我们提取最后一个 Token 作为这一帧的总结
 
-        # 3. 返回 new_history_state
+        vlm_output = outputs_embeds[0]
+        new_history_state = None
+
+        if vlm_output is not None:
+            # 提取最后一个 token: [Batch, 1, Hidden]
+            current_frame_summary = vlm_output[:, -1:, :]
+            if self.history_adapter.weight.dtype != current_frame_summary.dtype:
+                self.history_adapter.to(current_frame_summary.dtype)
+            # 经过 adapter 变成下一帧的输入 embedding
+            new_history_state = self.history_adapter(current_frame_summary)
+
         return outputs_embeds, past_key_values, new_history_state
-        # ================= [NEW END] =================
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

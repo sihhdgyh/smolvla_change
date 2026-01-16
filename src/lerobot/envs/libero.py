@@ -29,7 +29,7 @@ from gymnasium import spaces
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from src.lerobot.envs.enrich_text import get_enriched_text
+#from .enrich_text import get_enriched_text
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -310,10 +310,10 @@ class LiberoEnv(gym.Env):
 
         # 3. 调用你的 VLM 函数进行丰富化
         # 注意：确保 get_enriched_text 函数在外部已定义，或作为类方法
-        print(f"正在丰富化原始指令: {self.task_description}")
-        enriched_text = get_enriched_text(current_img, self.task_description)
-        self.enriched_task_description = enriched_text
-        print(f"丰富后指令: {self.enriched_task_description}")
+        # print(f"正在丰富化原始指令: {self.task_description}")
+        # enriched_text = get_enriched_text(current_img, self.task_description)
+        # self.enriched_task_description = enriched_text
+        # print(f"丰富后指令: {self.enriched_task_description}")
 
         if self.control_mode == "absolute":
             for robot in self._env.robots:
